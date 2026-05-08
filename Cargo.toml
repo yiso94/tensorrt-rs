@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "tensorrt",
+    "tensorrt-sys",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+description = "Rust bindings for NVIDIA TensorRT."
+repository = "https://github.com/yiso94/tensorrt-rs.git"
+license = "MIT"
+
+[workspace.dependencies]
+candle-core = { version = "0.10.2", default-features = false }
+cc = "1.2.61"
+cudarc = { version = "0.19.4", default-features = false, features = ["driver", "f16"] }
+half = "2.5"
+tensorrt-sys = { path = "tensorrt-sys", version = "0.1.0" }

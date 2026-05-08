@@ -1,0 +1,17 @@
+[package]
+name = "tensorrt"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+candle-core.workspace = true
+cudarc = { workspace = true, optional = true }
+half = { workspace = true, optional = true }
+tensorrt-sys.workspace = true
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "dep:cudarc", "dep:half"]

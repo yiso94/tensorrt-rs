@@ -1,0 +1,11 @@
+[package]
+name = "tensorrt-sys"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+links = "tensorrt_rs"
+
+[build-dependencies]
+cc.workspace = true
