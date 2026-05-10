@@ -23,30 +23,6 @@ pub(crate) fn select_outputs(
         .collect()
 }
 
-#[cfg(feature = "cuda")]
-pub(crate) fn select_outputs_by_owned_names(
-    output_infos: Vec<TensorInfo>,
-    output_names: &[String],
-) -> Result<Vec<TensorInfo>> {
-    if output_names.is_empty() {
-        return Ok(output_infos);
-    }
-
-    output_names
-        .iter()
-        .map(|name| {
-            output_infos
-                .iter()
-                .find(|tensor| tensor.name == *name)
-                .cloned()
-                .ok_or_else(|| Error::InvalidShape {
-                    tensor: name.clone(),
-                    reason: "output tensor was not reported by TensorRT shape inference".to_owned(),
-                })
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,24 +58,6 @@ mod tests {
             Error::InvalidShape { tensor, .. } => assert_eq!(tensor, "missing"),
             err => panic!("expected InvalidShape, got {err:?}"),
         }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn select_outputs_by_owned_names_preserves_requested_order() {
-        let selected = select_outputs_by_owned_names(
-            test_outputs(),
-            &["hidden".to_owned(), "logits".to_owned()],
-        )
-        .unwrap();
-
-        assert_eq!(
-            selected
-                .iter()
-                .map(|tensor| tensor.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["hidden", "logits"]
-        );
     }
 
     fn test_outputs() -> Vec<TensorInfo> {

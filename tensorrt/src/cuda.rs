@@ -5,6 +5,8 @@ use candle_core::DeviceLocation;
 use std::ffi::CStr;
 use std::fmt;
 use std::marker::PhantomData;
+#[cfg(feature = "cuda")]
+use std::os::raw::c_ulonglong;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr::{self, NonNull};
 
@@ -58,12 +60,20 @@ impl<'a> CudaStream<'a> {
         }
     }
 
-    pub fn as_raw(self) -> *mut c_void {
+    pub fn as_raw(&self) -> *mut c_void {
         self.raw
     }
 
-    pub fn device_location(self) -> Option<DeviceLocation> {
+    pub fn device_location(&self) -> Option<DeviceLocation> {
         self.device_location
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        synchronize_stream(*self)
+    }
+
+    pub fn wait_event(&self, event: CudaEvent) -> Result<()> {
+        stream_wait_event(*self, event)
     }
 }
 
@@ -82,8 +92,12 @@ impl CudaEvent {
         Self(raw)
     }
 
-    pub fn as_raw(self) -> *mut c_void {
+    pub fn as_raw(&self) -> *mut c_void {
         self.0
+    }
+
+    pub fn record(&self, stream: CudaStream<'_>) -> Result<()> {
+        record_event(*self, stream)
     }
 }
 
@@ -102,12 +116,17 @@ impl fmt::Display for CudaError {
 impl std::error::Error for CudaError {}
 
 /// Owned CUDA event used for explicit stream dependencies.
+#[derive(Debug)]
 pub struct CudaEventHandle {
     raw: NonNull<c_void>,
 }
 
+unsafe impl Send for CudaEventHandle {}
+unsafe impl Sync for CudaEventHandle {}
+
 impl CudaEventHandle {
-    pub fn new() -> Result<Self> {
+    #[cfg(feature = "cuda")]
+    fn new() -> Result<Self> {
         let mut raw = ptr::null_mut();
         unsafe {
             check_cuda(ffi::cudaEventCreateWithFlags(
@@ -153,8 +172,29 @@ impl CudaEventHandle {
         }
     }
 
+    #[cfg(feature = "cuda")]
+    pub fn new_for_stream(stream: CudaStream<'_>) -> Result<Self> {
+        let Some(location) = stream.device_location() else {
+            return Err(Error::InvalidShape {
+                tensor: "<cuda-event>".to_owned(),
+                reason: "CUDA event requires a stream with device metadata".to_owned(),
+            });
+        };
+        Self::new_for_device_location(location)
+    }
+
     pub fn as_event(&self) -> CudaEvent {
         CudaEvent(self.raw.as_ptr())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn synchronize(&self) -> Result<()> {
+        synchronize_event(self.as_event())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn is_complete(&self) -> Result<bool> {
+        query_event(self.as_event())
     }
 }
 
@@ -166,11 +206,11 @@ impl Drop for CudaEventHandle {
     }
 }
 
-pub fn synchronize_stream(stream: CudaStream<'_>) -> Result<()> {
+pub(crate) fn synchronize_stream(stream: CudaStream<'_>) -> Result<()> {
     unsafe { check_cuda(ffi::cudaStreamSynchronize(stream.as_raw())) }
 }
 
-pub fn record_event(event: CudaEvent, stream: CudaStream<'_>) -> Result<()> {
+pub(crate) fn record_event(event: CudaEvent, stream: CudaStream<'_>) -> Result<()> {
     unsafe { check_cuda(ffi::cudaEventRecord(event.as_raw(), stream.as_raw())) }
 }
 
@@ -191,8 +231,96 @@ pub(crate) fn synchronize_event(event: CudaEvent) -> Result<()> {
     unsafe { check_cuda(ffi::cudaEventSynchronize(event.as_raw())) }
 }
 
-pub fn stream_wait_event(stream: CudaStream<'_>, event: CudaEvent) -> Result<()> {
+pub(crate) fn stream_wait_event(stream: CudaStream<'_>, event: CudaEvent) -> Result<()> {
     unsafe { check_cuda(ffi::cudaStreamWaitEvent(stream.as_raw(), event.as_raw(), 0)) }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct CudaGraphExec {
+    raw: NonNull<c_void>,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaGraphExec {
+    pub(crate) fn capture(
+        stream: CudaStream<'_>,
+        enqueue: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
+        unsafe {
+            check_cuda(ffi::cudaStreamBeginCapture(
+                stream.as_raw(),
+                ffi::CUDA_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            ))?;
+        }
+
+        let enqueue_result = enqueue();
+        let mut graph_raw = ptr::null_mut();
+        let end_capture = unsafe { ffi::cudaStreamEndCapture(stream.as_raw(), &mut graph_raw) };
+
+        if let Err(error) = enqueue_result {
+            if end_capture == ffi::CUDA_SUCCESS
+                && let Some(graph_raw) = NonNull::new(graph_raw)
+            {
+                unsafe {
+                    let _ = ffi::cudaGraphDestroy(graph_raw.as_ptr());
+                }
+            }
+            return Err(error);
+        }
+
+        check_cuda(end_capture)?;
+        let graph = CudaGraph {
+            raw: NonNull::new(graph_raw).ok_or_else(|| {
+                Error::Cuda(CudaError {
+                    code: 0,
+                    message: "cudaStreamEndCapture returned null graph".to_owned(),
+                })
+            })?,
+        };
+
+        let mut exec_raw = ptr::null_mut();
+        unsafe {
+            check_cuda(ffi::cudaGraphInstantiate(
+                &mut exec_raw,
+                graph.raw.as_ptr(),
+                0,
+            ))?;
+        }
+        let raw = NonNull::new(exec_raw).ok_or_else(|| {
+            Error::Cuda(CudaError {
+                code: 0,
+                message: "cudaGraphInstantiate returned null graph executable".to_owned(),
+            })
+        })?;
+        Ok(Self { raw })
+    }
+
+    pub(crate) fn launch(&self, stream: CudaStream<'_>) -> Result<()> {
+        unsafe { check_cuda(ffi::cudaGraphLaunch(self.raw.as_ptr(), stream.as_raw())) }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for CudaGraphExec {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ffi::cudaGraphExecDestroy(self.raw.as_ptr());
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct CudaGraph {
+    raw: NonNull<c_void>,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for CudaGraph {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ffi::cudaGraphDestroy(self.raw.as_ptr());
+        }
+    }
 }
 
 pub(crate) fn check_cuda(code: c_int) -> Result<()> {
@@ -293,6 +421,8 @@ impl Drop for DeviceBuffer {
 }
 
 mod ffi {
+    #[cfg(feature = "cuda")]
+    use super::c_ulonglong;
     use super::{c_char, c_int, c_void};
 
     pub const CUDA_SUCCESS: c_int = 0;
@@ -300,7 +430,10 @@ mod ffi {
     pub const CUDA_ERROR_NOT_READY: c_int = 600;
     pub const CUDA_MEMCPY_HOST_TO_DEVICE: c_int = 1;
     pub const CUDA_MEMCPY_DEVICE_TO_HOST: c_int = 2;
+    #[cfg(feature = "cuda")]
     pub const CUDA_EVENT_DISABLE_TIMING: c_int = 2;
+    #[cfg(feature = "cuda")]
+    pub const CUDA_STREAM_CAPTURE_MODE_THREAD_LOCAL: c_int = 1;
 
     #[link(name = "cudart")]
     unsafe extern "C" {
@@ -314,6 +447,7 @@ mod ffi {
             stream: *mut c_void,
         ) -> c_int;
         pub fn cudaStreamSynchronize(stream: *mut c_void) -> c_int;
+        #[cfg(feature = "cuda")]
         pub fn cudaEventCreateWithFlags(event: *mut *mut c_void, flags: c_int) -> c_int;
         pub fn cudaEventDestroy(event: *mut c_void) -> c_int;
         pub fn cudaEventRecord(event: *mut c_void, stream: *mut c_void) -> c_int;
@@ -326,6 +460,22 @@ mod ffi {
         #[cfg(feature = "cuda")]
         pub fn cudaEventSynchronize(event: *mut c_void) -> c_int;
         pub fn cudaStreamWaitEvent(stream: *mut c_void, event: *mut c_void, flags: c_int) -> c_int;
+        #[cfg(feature = "cuda")]
+        pub fn cudaStreamBeginCapture(stream: *mut c_void, mode: c_int) -> c_int;
+        #[cfg(feature = "cuda")]
+        pub fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> c_int;
+        #[cfg(feature = "cuda")]
+        pub fn cudaGraphInstantiate(
+            graph_exec: *mut *mut c_void,
+            graph: *mut c_void,
+            flags: c_ulonglong,
+        ) -> c_int;
+        #[cfg(feature = "cuda")]
+        pub fn cudaGraphLaunch(graph_exec: *mut c_void, stream: *mut c_void) -> c_int;
+        #[cfg(feature = "cuda")]
+        pub fn cudaGraphDestroy(graph: *mut c_void) -> c_int;
+        #[cfg(feature = "cuda")]
+        pub fn cudaGraphExecDestroy(graph_exec: *mut c_void) -> c_int;
         pub fn cudaGetErrorString(error: c_int) -> *const c_char;
     }
 }

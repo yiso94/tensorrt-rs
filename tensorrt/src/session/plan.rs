@@ -1,4 +1,7 @@
 use crate::{DataType, DeviceInputTensor, Dims};
+use smallvec::SmallVec;
+
+const INLINE_PLAN_TENSORS: usize = 4;
 
 #[derive(Debug)]
 pub(crate) struct DeviceOutputPlan {
@@ -10,32 +13,38 @@ pub(crate) struct DeviceOutputPlan {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RunPlanKey {
-    pub(crate) inputs: Vec<RunPlanInputKey>,
-    pub(crate) outputs: Vec<String>,
+    pub(crate) inputs: SmallVec<[RunPlanInputKey; INLINE_PLAN_TENSORS]>,
+    pub(crate) outputs: SmallVec<[usize; INLINE_PLAN_TENSORS]>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RunPlanInputKey {
-    name: String,
+    tensor_index: usize,
     data_type: DataType,
     shape: Dims,
+    bytes: usize,
 }
 
 impl RunPlanKey {
-    pub(crate) fn new<'name>(
-        inputs: &[DeviceInputTensor<'_>],
-        output_names: impl IntoIterator<Item = &'name str>,
-    ) -> Self {
+    pub(crate) fn new<I, O>(inputs: I, output_indices: O) -> Self
+    where
+        I: IntoIterator<Item = RunPlanInputKey>,
+        O: IntoIterator<Item = usize>,
+    {
         Self {
-            inputs: inputs
-                .iter()
-                .map(|input| RunPlanInputKey {
-                    name: input.name.to_owned(),
-                    data_type: input.data_type,
-                    shape: input.shape.clone(),
-                })
-                .collect(),
-            outputs: output_names.into_iter().map(str::to_owned).collect(),
+            inputs: inputs.into_iter().collect(),
+            outputs: output_indices.into_iter().collect(),
+        }
+    }
+}
+
+impl RunPlanInputKey {
+    pub(crate) fn new(tensor_index: usize, input: &DeviceInputTensor<'_>) -> Self {
+        Self {
+            tensor_index,
+            data_type: input.data_type,
+            shape: input.shape.clone(),
+            bytes: input.bytes,
         }
     }
 }
@@ -47,7 +56,7 @@ mod tests {
 
     #[test]
     fn run_plan_key_preserves_input_and_output_order() {
-        let inputs = vec![
+        let inputs = [
             DeviceInputTensor::new(
                 "input_ids",
                 DataType::Int32,
@@ -64,16 +73,22 @@ mod tests {
             ),
         ];
 
-        let key = RunPlanKey::new(&inputs, ["logits", "hidden"]);
+        let key = RunPlanKey::new(
+            [
+                RunPlanInputKey::new(0, &inputs[0]),
+                RunPlanInputKey::new(1, &inputs[1]),
+            ],
+            [2, 3],
+        );
 
         assert_eq!(
             key.inputs
                 .iter()
-                .map(|input| input.name.as_str())
+                .map(|input| input.tensor_index)
                 .collect::<Vec<_>>(),
-            vec!["input_ids", "position_ids"]
+            vec![0, 1]
         );
-        assert_eq!(key.outputs, vec!["logits", "hidden"]);
+        assert_eq!(key.outputs.as_slice(), [2, 3]);
     }
 
     #[test]
@@ -94,8 +109,8 @@ mod tests {
         )];
 
         assert_eq!(
-            RunPlanKey::new(&left, ["output"]),
-            RunPlanKey::new(&right, ["output"])
+            RunPlanKey::new([RunPlanInputKey::new(0, &left[0])], [1]),
+            RunPlanKey::new([RunPlanInputKey::new(0, &right[0])], [1])
         );
     }
 
@@ -117,12 +132,39 @@ mod tests {
         )];
 
         assert_ne!(
-            RunPlanKey::new(&left, ["output"]),
-            RunPlanKey::new(&right, ["output"])
+            RunPlanKey::new([RunPlanInputKey::new(0, &left[0])], [1]),
+            RunPlanKey::new([RunPlanInputKey::new(0, &right[0])], [1])
         );
         assert_ne!(
-            RunPlanKey::new(&left, ["output"]),
-            RunPlanKey::new(&left, ["other"])
+            RunPlanKey::new([RunPlanInputKey::new(0, &left[0])], [1]),
+            RunPlanKey::new([RunPlanInputKey::new(0, &left[0])], [2])
+        );
+    }
+
+    #[test]
+    fn run_plan_key_distinguishes_tensor_indices_and_byte_lengths() {
+        let left = [DeviceInputTensor::new(
+            "input",
+            DataType::Float,
+            Dims::new([1, 4]).unwrap(),
+            std::ptr::null(),
+            16,
+        )];
+        let wrong_bytes = [DeviceInputTensor::new(
+            "input",
+            DataType::Float,
+            Dims::new([1, 4]).unwrap(),
+            std::ptr::null(),
+            12,
+        )];
+
+        assert_ne!(
+            RunPlanKey::new([RunPlanInputKey::new(0, &left[0])], [1]),
+            RunPlanKey::new([RunPlanInputKey::new(2, &left[0])], [1])
+        );
+        assert_ne!(
+            RunPlanKey::new([RunPlanInputKey::new(0, &left[0])], [1]),
+            RunPlanKey::new([RunPlanInputKey::new(0, &wrong_bytes[0])], [1])
         );
     }
 }

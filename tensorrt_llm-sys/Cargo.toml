@@ -1,15 +1,15 @@
 [package]
-name = "tensorrt-sys"
+name = "tensorrt-llm-sys"
 version.workspace = true
 edition.workspace = true
-description = "Low-level C ABI shims for NVIDIA TensorRT Rust bindings."
+description = "Low-level C ABI shims for TensorRT-LLM Rust bindings."
 homepage.workspace = true
 repository.workspace = true
 readme.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
-links = "tensorrt_rs"
+links = "tensorrt_llm_rs"
 
 [build-dependencies]
 cc.workspace = true

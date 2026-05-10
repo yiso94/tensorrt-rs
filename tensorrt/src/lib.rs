@@ -22,10 +22,7 @@ mod tests;
 pub const MAX_DIMS: usize = ffi::MAX_DIMS;
 
 pub use candle::{InputTensors, OutputTensors};
-pub use cuda::{
-    CudaError, CudaEvent, CudaEventHandle, CudaStream, record_event, stream_wait_event,
-    synchronize_stream,
-};
+pub use cuda::{CudaError, CudaEvent, CudaEventHandle, CudaStream};
 pub use data_type::{DataType, bf16_bits_to_f32, f32_to_bf16_bits};
 pub use engine::{Engine, ExecutionContext, LogSeverity, Runtime, Version, version};
 pub use error::{Error, Result};
@@ -33,6 +30,6 @@ pub use prepared::{PreparedDeviceSession, PreparedEnqueuedInference, PreparedMix
 pub use session::{EnqueuedInference, Session};
 pub use tensor::{
     DeviceInputTensor, DeviceOutputTensor, Dims, HostInputTensor, HostOutputTensor, HostTensor,
-    InputBinding, TensorIOMode, TensorInfo, TensorLocation, TensorShape, as_bytes,
-    dims_to_usize_shape, element_count, tensor_byte_len,
+    InputBinding, TensorIOMode, TensorInfo, TensorLocation, TensorShape, as_bytes, dims_as_usize,
+    element_count, tensor_byte_len,
 };

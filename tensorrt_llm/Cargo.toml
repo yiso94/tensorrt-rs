@@ -1,8 +1,8 @@
 [package]
-name = "tensorrt"
+name = "tensorrt-llm"
 version.workspace = true
 edition.workspace = true
-description = "Rust runtime bindings for NVIDIA TensorRT with Candle tensor I/O."
+description = "Rust bindings for the TensorRT-LLM Executor API with Candle tensor support."
 homepage.workspace = true
 repository.workspace = true
 readme.workspace = true
@@ -13,10 +13,13 @@ categories.workspace = true
 [dependencies]
 candle-core.workspace = true
 cudarc = { workspace = true, optional = true }
-half = { workspace = true, optional = true }
+half.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 smallvec.workspace = true
-tensorrt-sys.workspace = true
+tensorrt.workspace = true
+tensorrt-llm-sys.workspace = true
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "dep:cudarc", "dep:half"]
+cuda = ["candle-core/cuda", "dep:cudarc", "tensorrt/cuda"]

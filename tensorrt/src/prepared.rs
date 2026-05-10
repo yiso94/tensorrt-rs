@@ -1,4 +1,4 @@
-use super::cuda::{CudaStream, DeviceBuffer, synchronize_stream};
+use super::cuda::{CudaStream, DeviceBuffer};
 use super::data_type::DataType;
 use super::engine::ExecutionContext;
 use super::error::{Error, Result};
@@ -290,7 +290,7 @@ impl<'stream> PreparedEnqueuedInference<'_, 'stream> {
     }
 
     pub fn synchronize(mut self) -> Result<()> {
-        synchronize_stream(self.stream)?;
+        self.stream.synchronize()?;
         self.synchronized = true;
         Ok(())
     }
@@ -311,7 +311,7 @@ impl<'stream> PreparedEnqueuedInference<'_, 'stream> {
 impl Drop for PreparedEnqueuedInference<'_, '_> {
     fn drop(&mut self) {
         if !self.synchronized {
-            let _ = synchronize_stream(self.stream);
+            let _ = self.stream.synchronize();
         }
     }
 }

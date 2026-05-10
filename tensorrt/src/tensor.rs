@@ -1,17 +1,18 @@
 use super::data_type::DataType;
 use super::error::{Error, Result};
 use super::{MAX_DIMS, ffi};
+use smallvec::SmallVec;
 use std::{ffi::c_void, mem, ptr, slice};
 
 /// Shape dimensions for a TensorRT tensor.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Dims {
-    values: Vec<i64>,
+    values: SmallVec<[i64; MAX_DIMS]>,
 }
 
 impl Dims {
-    pub fn new(values: impl Into<Vec<i64>>) -> Result<Self> {
-        let values = values.into();
+    pub fn new(values: impl IntoIterator<Item = i64>) -> Result<Self> {
+        let values: SmallVec<[i64; MAX_DIMS]> = values.into_iter().collect();
         if values.len() > MAX_DIMS {
             return Err(Error::InvalidDimensions {
                 len: values.len(),
@@ -29,7 +30,7 @@ impl Dims {
         self.values.len()
     }
 
-    pub fn has_dynamic_dim(&self) -> bool {
+    pub fn is_dynamic(&self) -> bool {
         self.values.iter().any(|&dim| dim < 0)
     }
 
@@ -39,7 +40,7 @@ impl Dims {
         if len > MAX_DIMS {
             return Err(Error::InvalidDimensionCount(dims.nb_dims));
         }
-        Self::new(dims.d[..len].to_vec())
+        Self::new(dims.d[..len].iter().copied())
     }
 
     pub(crate) fn to_ffi(&self) -> ffi::Dims {
@@ -56,7 +57,7 @@ impl TryFrom<&[i64]> for Dims {
     type Error = Error;
 
     fn try_from(value: &[i64]) -> Result<Self> {
-        Self::new(value.to_vec())
+        Self::new(value.iter().copied())
     }
 }
 
@@ -70,7 +71,7 @@ impl<const N: usize> TryFrom<[i64; N]> for Dims {
 
 impl From<Dims> for Vec<i64> {
     fn from(value: Dims) -> Self {
-        value.values
+        value.values.into_vec()
     }
 }
 
@@ -367,8 +368,8 @@ impl HostTensor {
         element_count(&self.name, &self.shape)
     }
 
-    pub fn shape_usize(&self) -> Result<Vec<usize>> {
-        dims_to_usize_shape(&self.name, &self.shape)
+    pub fn shape_as_usize(&self) -> Result<Vec<usize>> {
+        dims_as_usize(&self.name, &self.shape)
     }
 
     pub fn into_f32_vec(self) -> Result<Vec<f32>> {
@@ -383,7 +384,19 @@ impl HostTensor {
         self.into_vec(DataType::Half)
     }
 
-    pub fn into_vec<T: Copy>(self, expected: DataType) -> Result<Vec<T>> {
+    pub fn into_i32_vec(self) -> Result<Vec<i32>> {
+        self.into_vec(DataType::Int32)
+    }
+
+    pub fn into_i64_vec(self) -> Result<Vec<i64>> {
+        self.into_vec(DataType::Int64)
+    }
+
+    pub fn into_u8_vec(self) -> Result<Vec<u8>> {
+        self.into_vec(DataType::Uint8)
+    }
+
+    fn into_vec<T: Copy>(self, expected: DataType) -> Result<Vec<T>> {
         if self.data_type != expected {
             return Err(Error::TypeMismatch {
                 tensor: self.name,
@@ -427,7 +440,7 @@ pub fn element_count(tensor: &str, shape: &Dims) -> Result<usize> {
     })
 }
 
-pub fn dims_to_usize_shape(tensor: &str, shape: &Dims) -> Result<Vec<usize>> {
+pub fn dims_as_usize(tensor: &str, shape: &Dims) -> Result<Vec<usize>> {
     shape
         .as_slice()
         .iter()

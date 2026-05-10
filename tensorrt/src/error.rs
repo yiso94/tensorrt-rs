@@ -142,3 +142,103 @@ impl From<candle_core::Error> for Error {
         Self::Candle(error)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+    use std::ffi::CString;
+
+    #[test]
+    fn ffi_status_maps_to_rust_errors() {
+        assert!(Error::from_status(ffi::Status::Ok).is_ok());
+        assert!(matches!(
+            Error::from_status(ffi::Status::InvalidArgument),
+            Err(Error::InvalidArgument)
+        ));
+        assert!(matches!(
+            Error::from_status(ffi::Status::AllocationFailed),
+            Err(Error::AllocationFailed)
+        ));
+        assert!(matches!(
+            Error::from_status(ffi::Status::NullPointer),
+            Err(Error::NullPointer)
+        ));
+        assert!(matches!(
+            Error::from_status(ffi::Status::TensorRtError),
+            Err(Error::TensorRtError)
+        ));
+        assert!(matches!(
+            Error::from_status(ffi::Status::Exception),
+            Err(Error::Exception)
+        ));
+    }
+
+    #[test]
+    fn display_messages_cover_public_error_variants() {
+        let invalid_name = CString::new(b"bad\0name".to_vec()).unwrap_err();
+        let cases = [
+            Error::InvalidArgument,
+            Error::AllocationFailed,
+            Error::NullPointer,
+            Error::TensorRtError,
+            Error::Exception,
+            Error::InvalidTensorName(invalid_name),
+            Error::InvalidDimensions { len: 9, max: 8 },
+            Error::InvalidDimensionCount(-1),
+            Error::InvalidShape {
+                tensor: "input".to_owned(),
+                reason: "rank mismatch".to_owned(),
+            },
+            Error::SizeMismatch {
+                tensor: "output".to_owned(),
+                expected_bytes: 16,
+                actual_bytes: 8,
+            },
+            Error::TypeMismatch {
+                tensor: "output".to_owned(),
+                expected: DataType::Float,
+                actual: DataType::Half,
+            },
+            Error::TensorModeMismatch {
+                tensor: "output".to_owned(),
+                expected: TensorIOMode::Output,
+                actual: TensorIOMode::Input,
+            },
+            Error::UnsupportedDataType {
+                data_type: DataType::Int4,
+                context: "unit test",
+            },
+            Error::UnsupportedCandleDType {
+                dtype: candle_core::DType::U8,
+                context: "unit test",
+            },
+        ];
+
+        for error in cases {
+            assert!(!error.to_string().is_empty());
+            assert!(error.source().is_none() || !error.source().unwrap().to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn source_returns_nested_errors() {
+        let invalid_name =
+            Error::InvalidTensorName(CString::new(b"bad\0name".to_vec()).unwrap_err());
+        assert!(invalid_name.source().is_some());
+
+        let cuda = Error::Cuda(CudaError {
+            code: 1,
+            message: "failure".to_owned(),
+        });
+        assert_eq!(cuda.to_string(), "CUDA error 1: failure");
+        assert!(cuda.source().is_some());
+
+        let candle = Error::Candle(candle_core::Error::UnsupportedDTypeForOp(
+            candle_core::DType::U8,
+            "unit-test",
+        ));
+        assert!(candle.to_string().contains("Candle tensor error"));
+        assert!(candle.source().is_some());
+    }
+}

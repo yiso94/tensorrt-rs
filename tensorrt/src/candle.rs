@@ -7,7 +7,7 @@
 //! type.
 
 #[cfg(feature = "cuda")]
-use crate::session::DeviceOutputPlan;
+use crate::session::{DeviceOutputPlan, DeviceRunCompletion};
 use crate::{CudaStream, DataType, Dims, Error, Result, Session, TensorShape};
 #[cfg(feature = "cuda")]
 use crate::{DeviceInputTensor, DeviceOutputTensor, tensor_byte_len};
@@ -18,14 +18,17 @@ use candle_core::{DType, Tensor};
 use cudarc::driver::DevicePtr;
 #[cfg(feature = "cuda")]
 use half::{bf16, f16};
+use smallvec::SmallVec;
 #[cfg(feature = "cuda")]
 use std::ffi::c_void;
 use std::ops::Index;
 
+const INLINE_TENSORS: usize = 4;
+
 /// Named Candle inputs for a TensorRT session run.
 #[derive(Clone, Debug, Default)]
 pub struct InputTensors<'a> {
-    inputs: Vec<(String, &'a Tensor)>,
+    inputs: SmallVec<[(String, &'a Tensor); INLINE_TENSORS]>,
 }
 
 impl<'a> InputTensors<'a> {
@@ -69,7 +72,7 @@ impl<'a> InputTensors<'a> {
             .map(|(name, tensor)| (name.as_str(), *tensor))
     }
 
-    pub(crate) fn shape_infos(&self) -> Result<Vec<TensorShape<'_>>> {
+    pub(crate) fn shape_infos(&self) -> Result<SmallVec<[TensorShape<'_>; INLINE_TENSORS]>> {
         self.inputs
             .iter()
             .map(|(name, tensor)| Ok(TensorShape::new(name, candle_dims(name, tensor)?)))
@@ -80,7 +83,7 @@ impl<'a> InputTensors<'a> {
 /// Named Candle outputs written by a TensorRT session run.
 #[derive(Clone, Debug, Default)]
 pub struct OutputTensors {
-    outputs: Vec<(String, Tensor)>,
+    outputs: SmallVec<[(String, Tensor); INLINE_TENSORS]>,
 }
 
 impl OutputTensors {
@@ -120,10 +123,6 @@ impl OutputTensors {
     pub fn is_empty(&self) -> bool {
         self.outputs.is_empty()
     }
-
-    pub fn into_vec(self) -> Vec<(String, Tensor)> {
-        self.outputs
-    }
 }
 
 impl Index<&str> for OutputTensors {
@@ -137,7 +136,7 @@ impl Index<&str> for OutputTensors {
 
 impl IntoIterator for OutputTensors {
     type Item = (String, Tensor);
-    type IntoIter = std::vec::IntoIter<(String, Tensor)>;
+    type IntoIter = smallvec::IntoIter<[(String, Tensor); INLINE_TENSORS]>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.outputs.into_iter()
@@ -187,7 +186,7 @@ fn run_session_with_cuda_outputs(
     }
     let keepalive = run_keepalive(inputs, outputs);
 
-    let device_inputs = inputs
+    let device_inputs: SmallVec<[DeviceInputTensor<'_>; 4]> = inputs
         .iter()
         .map(|(name, tensor)| {
             let prepared = prepare_cuda_input(name, tensor)?;
@@ -199,7 +198,7 @@ fn run_session_with_cuda_outputs(
                 prepared.bytes,
             ))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<_>>()?;
 
     let mut context = session.pooled_execution_context()?;
     let output_plan = session.cached_device_output_plan(
@@ -208,7 +207,7 @@ fn run_session_with_cuda_outputs(
         outputs.outputs.iter().map(|(name, _)| name.as_str()),
     )?;
 
-    let mut device_outputs = output_plan
+    let mut device_outputs: SmallVec<[DeviceOutputTensor<'_>; 4]> = output_plan
         .iter()
         .zip(outputs.outputs.iter_mut())
         .map(|(plan, (name, tensor))| {
@@ -221,27 +220,21 @@ fn run_session_with_cuda_outputs(
                 output.bytes,
             ))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<_>>()?;
 
     validate_cuda_output_aliases(&device_inputs, &device_outputs)?;
 
     let event_device_location = output_device.location();
     let completion_event = session.completion_event(event_device_location)?;
     unsafe {
-        session.enqueue_device_with_context(
-            &mut context,
+        session.enqueue_device_auto_graph(
+            context,
             &device_inputs,
             &mut device_outputs,
             stream,
+            DeviceRunCompletion::new(event_device_location, completion_event, keepalive),
         )?;
     }
-    session.defer_context_until_stream_complete(
-        context,
-        event_device_location,
-        completion_event,
-        stream,
-        keepalive,
-    )?;
 
     Ok(())
 }
@@ -269,7 +262,7 @@ fn validate_stream_device(device: &Device, stream: CudaStream<'_>) -> Result<()>
 }
 
 #[cfg(feature = "cuda")]
-fn run_keepalive(inputs: &InputTensors<'_>, outputs: &OutputTensors) -> Vec<Tensor> {
+fn run_keepalive(inputs: &InputTensors<'_>, outputs: &OutputTensors) -> SmallVec<[Tensor; 8]> {
     inputs
         .iter()
         .map(|(_, tensor)| tensor.clone())
@@ -638,6 +631,7 @@ mod tests {
         let mut outputs = OutputTensors::new([("logits", tensor)]);
 
         assert_eq!(outputs.iter().count(), 1);
+        assert!(!outputs.outputs.spilled());
         assert_eq!(outputs["logits"].dims(), &[2]);
         assert!(outputs.get("missing").is_none());
         assert_eq!(outputs.get("logits").unwrap().dtype(), DType::F32);
@@ -655,6 +649,7 @@ mod tests {
 
         assert_eq!(inputs.len(), 2);
         assert!(!inputs.is_empty());
+        assert!(!inputs.inputs.spilled());
         assert_eq!(inputs.get("input_ids").unwrap().dims(), &[3]);
         assert_eq!(
             inputs.iter().map(|(name, _)| name).collect::<Vec<_>>(),
@@ -663,13 +658,12 @@ mod tests {
     }
 
     #[test]
-    fn candle_outputs_can_be_consumed_as_vec() {
+    fn candle_outputs_can_be_consumed_by_iterator() {
         let logits = Tensor::zeros(2, DType::F32, &Device::Cpu).unwrap();
         let hidden = Tensor::zeros((1, 2), DType::F32, &Device::Cpu).unwrap();
         let outputs = OutputTensors::new([("logits", logits), ("hidden", hidden)]);
 
         let names = outputs
-            .into_vec()
             .into_iter()
             .map(|(name, _)| name)
             .collect::<Vec<_>>();
@@ -687,6 +681,7 @@ mod tests {
         let keepalive = run_keepalive(&inputs, &outputs);
 
         assert_eq!(keepalive.len(), 2);
+        assert!(!keepalive.spilled());
         assert_eq!(keepalive[0].dims(), &[2]);
         assert_eq!(keepalive[1].dtype(), DType::F32);
     }

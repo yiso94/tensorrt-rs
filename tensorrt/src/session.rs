@@ -1,6 +1,6 @@
 #[cfg(feature = "cuda")]
-use super::cuda::{CudaEventHandle, query_event, record_event, synchronize_event};
-use super::cuda::{CudaStream, DeviceBuffer, synchronize_stream};
+use super::cuda::{CudaEventHandle, CudaGraphExec, query_event, synchronize_event};
+use super::cuda::{CudaStream, DeviceBuffer};
 use super::data_type::DataType;
 use super::engine::{Engine, ExecutionContext, LogSeverity, Runtime};
 use super::error::{Error, Result};
@@ -14,10 +14,14 @@ use crate::candle::{InputTensors, OutputTensors, run_session};
 use candle_core::DeviceLocation;
 #[cfg(feature = "cuda")]
 use candle_core::Tensor;
+#[cfg(feature = "cuda")]
+use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
+#[cfg(feature = "cuda")]
+use std::rc::Rc;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -28,10 +32,15 @@ mod select;
 #[cfg(feature = "cuda")]
 pub(crate) use plan::DeviceOutputPlan;
 #[cfg(feature = "cuda")]
-use plan::RunPlanKey;
+use plan::{RunPlanInputKey, RunPlanKey};
 use select::select_outputs;
+
 #[cfg(feature = "cuda")]
-use select::select_outputs_by_owned_names;
+const CUDA_GRAPH_INITIAL_BACKOFF_RUNS: usize = 8;
+#[cfg(feature = "cuda")]
+const CUDA_GRAPH_MAX_BACKOFF_RUNS: usize = 64;
+#[cfg(feature = "cuda")]
+const CUDA_GRAPH_MAX_CACHE_ENTRIES: usize = 16;
 
 /// TensorRT session wrapper for named inputs/outputs.
 ///
@@ -46,6 +55,12 @@ pub struct Session {
     event_pool: RefCell<HashMap<DeviceLocation, Vec<CudaEventHandle>>>,
     #[cfg(feature = "cuda")]
     run_plan_cache: RefCell<HashMap<RunPlanKey, Arc<[DeviceOutputPlan]>>>,
+    #[cfg(feature = "cuda")]
+    cuda_graph_cache: RefCell<HashMap<CudaGraphKey, Rc<CudaGraphEntry>>>,
+    #[cfg(feature = "cuda")]
+    cuda_graph_backoff: RefCell<HashMap<CudaGraphKey, CudaGraphBackoff>>,
+    #[cfg(feature = "cuda")]
+    in_flight_graphs: RefCell<Vec<InFlightGraph>>,
     io_tensors: Vec<TensorInfo>,
     io_tensor_index: HashMap<String, usize>,
     engine: Engine,
@@ -69,7 +84,7 @@ impl<'stream> EnqueuedInference<'stream> {
     }
 
     pub fn synchronize(mut self) -> Result<()> {
-        synchronize_stream(self.stream)?;
+        self.stream.synchronize()?;
         self.synchronized = true;
         Ok(())
     }
@@ -78,17 +93,17 @@ impl<'stream> EnqueuedInference<'stream> {
 impl Drop for EnqueuedInference<'_> {
     fn drop(&mut self) {
         if !self.synchronized {
-            let _ = synchronize_stream(self.stream);
+            let _ = self.stream.synchronize();
         }
     }
 }
 
 impl Session {
-    pub fn from_serialized_engine(engine_buffer: impl AsRef<[u8]>) -> Result<Self> {
-        Self::from_serialized_engine_with_logger(engine_buffer, LogSeverity::Warning)
+    pub fn new(engine_buffer: impl AsRef<[u8]>) -> Result<Self> {
+        Self::with_log_severity(engine_buffer, LogSeverity::Warning)
     }
 
-    pub fn from_serialized_engine_with_logger(
+    pub fn with_log_severity(
         engine_buffer: impl AsRef<[u8]>,
         min_severity: LogSeverity,
     ) -> Result<Self> {
@@ -108,6 +123,12 @@ impl Session {
             event_pool: RefCell::new(HashMap::new()),
             #[cfg(feature = "cuda")]
             run_plan_cache: RefCell::new(HashMap::new()),
+            #[cfg(feature = "cuda")]
+            cuda_graph_cache: RefCell::new(HashMap::new()),
+            #[cfg(feature = "cuda")]
+            cuda_graph_backoff: RefCell::new(HashMap::new()),
+            #[cfg(feature = "cuda")]
+            in_flight_graphs: RefCell::new(Vec::new()),
             io_tensors,
             io_tensor_index,
             engine,
@@ -132,14 +153,17 @@ impl Session {
         self.infer_shapes_with_context(&mut context, inputs)
     }
 
-    pub fn infer_candle_shapes(&self, inputs: &InputTensors<'_>) -> Result<Vec<TensorInfo>> {
+    pub fn infer_outputs(&self, inputs: &InputTensors<'_>) -> Result<Vec<TensorInfo>> {
         let shapes = inputs.shape_infos()?;
         self.infer_shapes(&shapes)
     }
 
     pub(crate) fn pooled_execution_context(&self) -> Result<PooledExecutionContext<'_>> {
         #[cfg(feature = "cuda")]
-        self.reclaim_finished_contexts()?;
+        {
+            self.reclaim_finished_contexts()?;
+            self.reclaim_finished_graphs()?;
+        }
 
         let (mut context, reused) = if let Some(context) = self.context_pool.borrow_mut().pop() {
             (context, true)
@@ -187,6 +211,34 @@ impl Session {
     }
 
     #[cfg(feature = "cuda")]
+    fn reclaim_finished_graphs(&self) -> Result<()> {
+        let mut completed_events = Vec::new();
+        {
+            let mut in_flight = self.in_flight_graphs.borrow_mut();
+            let mut index = 0;
+            while index < in_flight.len() {
+                if query_event(in_flight[index].event.as_event())? {
+                    let InFlightGraph {
+                        device_location,
+                        event,
+                        _keepalive,
+                        _graph_entry,
+                    } = in_flight.swap_remove(index);
+                    completed_events.push((device_location, event));
+                } else {
+                    index += 1;
+                }
+            }
+        }
+
+        let mut event_pool = self.event_pool.borrow_mut();
+        for (device_location, event) in completed_events {
+            event_pool.entry(device_location).or_default().push(event);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
     pub(crate) fn completion_event(
         &self,
         device_location: DeviceLocation,
@@ -215,18 +267,18 @@ impl Session {
         device_location: DeviceLocation,
         completion_event: CudaEventHandle,
         stream: CudaStream<'_>,
-        keepalive: Vec<Tensor>,
+        keepalive: SmallVec<[Tensor; 8]>,
     ) -> Result<()> {
         let mut in_flight = self.in_flight_contexts.borrow_mut();
         if in_flight.try_reserve(1).is_err() {
             drop(in_flight);
-            let _ = synchronize_stream(stream);
+            let _ = stream.synchronize();
             self.recycle_completion_event(device_location, completion_event);
             return Err(Error::AllocationFailed);
         }
-        if let Err(error) = record_event(completion_event.as_event(), stream) {
+        if let Err(error) = completion_event.as_event().record(stream) {
             drop(in_flight);
-            let _ = synchronize_stream(stream);
+            let _ = stream.synchronize();
             self.recycle_completion_event(device_location, completion_event);
             return Err(error);
         }
@@ -269,18 +321,16 @@ impl Session {
         inputs: &[DeviceInputTensor<'_>],
         output_names: impl IntoIterator<Item = &'name str>,
     ) -> Result<Arc<[DeviceOutputPlan]>> {
-        self.validate_device_inputs(inputs)?;
-
-        let key = RunPlanKey::new(inputs, output_names);
+        let key = self.device_run_plan_key(inputs, output_names)?;
 
         if let Some(output_infos) = self.run_plan_cache.borrow().get(&key).cloned() {
             set_device_input_shapes_if_needed(context, inputs)?;
             return Ok(output_infos);
         }
 
+        self.validate_device_inputs(inputs)?;
         set_device_input_shapes_if_needed(context, inputs)?;
-        let output_infos = self.inferred_output_infos(context)?;
-        let output_infos = select_outputs_by_owned_names(output_infos, &key.outputs)?;
+        let output_infos = self.inferred_output_infos_for_indices(context, &key.outputs)?;
         let output_infos = output_infos
             .into_iter()
             .map(|info| self.device_output_plan(info))
@@ -290,6 +340,65 @@ impl Session {
             .borrow_mut()
             .insert(key, output_infos.clone());
         Ok(output_infos)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn device_run_plan_key<'name>(
+        &self,
+        inputs: &[DeviceInputTensor<'_>],
+        output_names: impl IntoIterator<Item = &'name str>,
+    ) -> Result<RunPlanKey> {
+        let input_indices: SmallVec<[usize; 4]> = inputs
+            .iter()
+            .map(|input| self.tensor_index(input.name))
+            .collect::<Result<_>>()?;
+        let output_indices: SmallVec<[usize; 4]> = output_names
+            .into_iter()
+            .map(|name| self.tensor_index(name))
+            .collect::<Result<_>>()?;
+
+        Ok(RunPlanKey::new(
+            input_indices
+                .iter()
+                .copied()
+                .zip(inputs.iter())
+                .map(|(index, input)| RunPlanInputKey::new(index, input)),
+            output_indices,
+        ))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn inferred_output_infos_for_indices(
+        &self,
+        context: &ExecutionContext,
+        output_indices: &[usize],
+    ) -> Result<Vec<TensorInfo>> {
+        if output_indices.is_empty() {
+            return self.inferred_output_infos(context);
+        }
+
+        output_indices
+            .iter()
+            .map(|&index| {
+                let mut tensor =
+                    self.io_tensors
+                        .get(index)
+                        .cloned()
+                        .ok_or_else(|| Error::InvalidShape {
+                            tensor: format!("<tensor-index:{index}>"),
+                            reason: "tensor index is not an engine I/O tensor".to_owned(),
+                        })?;
+                if tensor.io_mode != TensorIOMode::Output {
+                    return Err(Error::TensorModeMismatch {
+                        tensor: tensor.name,
+                        expected: TensorIOMode::Output,
+                        actual: tensor.io_mode,
+                    });
+                }
+                tensor.shape = context.tensor_shape(&tensor.name)?;
+                Ok(tensor)
+            })
+            .collect()
     }
 
     #[cfg(feature = "cuda")]
@@ -314,6 +423,248 @@ impl Session {
         })
     }
 
+    #[cfg(feature = "cuda")]
+    pub(crate) unsafe fn enqueue_device_auto_graph(
+        &self,
+        context: PooledExecutionContext<'_>,
+        inputs: &[DeviceInputTensor<'_>],
+        outputs: &mut [DeviceOutputTensor<'_>],
+        stream: CudaStream<'_>,
+        completion: DeviceRunCompletion,
+    ) -> Result<()> {
+        let DeviceRunCompletion {
+            device_location,
+            event: completion_event,
+            keepalive,
+        } = completion;
+
+        self.reclaim_finished_graphs()?;
+        let key = self.cuda_graph_key(inputs, outputs, stream)?;
+
+        // CUDA Graph replay is only valid for the exact stream and concrete
+        // device addresses captured below. New tensors or a different stream
+        // intentionally fall back to a normal TensorRT enqueue.
+        if let Some(entry) = self.cuda_graph_cache.borrow().get(&key).cloned() {
+            if let Err(error) = entry.exec.launch(stream) {
+                self.cuda_graph_cache.borrow_mut().remove(&key);
+                self.recycle_completion_event(device_location, completion_event);
+                return Err(error);
+            }
+            return self.defer_graph_until_stream_complete(
+                device_location,
+                completion_event,
+                stream,
+                keepalive,
+                entry,
+            );
+        }
+
+        if self.in_flight_graphs.borrow().is_empty() {
+            if self.should_skip_cuda_graph_capture(&key) {
+                let mut context = context;
+                unsafe {
+                    self.enqueue_device_with_context(&mut context, inputs, outputs, stream)?;
+                }
+                return self.defer_context_until_stream_complete(
+                    context,
+                    device_location,
+                    completion_event,
+                    stream,
+                    keepalive,
+                );
+            }
+
+            match unsafe {
+                self.capture_device_graph(context, inputs, outputs, stream, key.clone())
+            } {
+                Ok(()) => {
+                    self.clear_cuda_graph_capture_backoff(&key);
+                    let entry = self
+                        .cuda_graph_cache
+                        .borrow()
+                        .get(&key)
+                        .cloned()
+                        .expect("captured graph was not cached");
+                    if let Err(error) = entry.exec.launch(stream) {
+                        self.cuda_graph_cache.borrow_mut().remove(&key);
+                        self.recycle_completion_event(device_location, completion_event);
+                        return Err(error);
+                    }
+                    return self.defer_graph_until_stream_complete(
+                        device_location,
+                        completion_event,
+                        stream,
+                        keepalive,
+                        entry,
+                    );
+                }
+                Err(error) => {
+                    let GraphCaptureError {
+                        mut context,
+                        error: _capture_error,
+                    } = *error;
+                    self.record_cuda_graph_capture_failure(key);
+                    unsafe {
+                        self.enqueue_device_with_context(&mut context, inputs, outputs, stream)?;
+                    }
+                    return self.defer_context_until_stream_complete(
+                        context,
+                        device_location,
+                        completion_event,
+                        stream,
+                        keepalive,
+                    );
+                }
+            }
+        }
+
+        let mut context = context;
+        unsafe {
+            self.enqueue_device_with_context(&mut context, inputs, outputs, stream)?;
+        }
+        self.defer_context_until_stream_complete(
+            context,
+            device_location,
+            completion_event,
+            stream,
+            keepalive,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn should_skip_cuda_graph_capture(&self, key: &CudaGraphKey) -> bool {
+        let mut backoff = self.cuda_graph_backoff.borrow_mut();
+        let Some(backoff) = backoff.get_mut(key) else {
+            return false;
+        };
+        if backoff.remaining_runs == 0 {
+            return false;
+        }
+
+        backoff.remaining_runs -= 1;
+        true
+    }
+
+    #[cfg(feature = "cuda")]
+    fn record_cuda_graph_capture_failure(&self, key: CudaGraphKey) {
+        self.cuda_graph_backoff
+            .borrow_mut()
+            .entry(key)
+            .and_modify(CudaGraphBackoff::back_off_again)
+            .or_insert_with(CudaGraphBackoff::new);
+    }
+
+    #[cfg(feature = "cuda")]
+    fn clear_cuda_graph_capture_backoff(&self, key: &CudaGraphKey) {
+        self.cuda_graph_backoff.borrow_mut().remove(key);
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_graph_key(
+        &self,
+        inputs: &[DeviceInputTensor<'_>],
+        outputs: &[DeviceOutputTensor<'_>],
+        stream: CudaStream<'_>,
+    ) -> Result<CudaGraphKey> {
+        let input_indices: SmallVec<[usize; 4]> = inputs
+            .iter()
+            .map(|input| self.tensor_index(input.name))
+            .collect::<Result<_>>()?;
+        let output_indices: SmallVec<[usize; 4]> = outputs
+            .iter()
+            .map(|output| self.tensor_index(output.name))
+            .collect::<Result<_>>()?;
+
+        Ok(CudaGraphKey::new(
+            input_indices
+                .iter()
+                .copied()
+                .zip(inputs.iter())
+                .map(|(index, input)| CudaGraphTensorKey::from_input(index, input)),
+            output_indices
+                .iter()
+                .copied()
+                .zip(outputs.iter())
+                .map(|(index, output)| CudaGraphTensorKey::from_output(index, output)),
+            stream,
+        ))
+    }
+
+    #[cfg(feature = "cuda")]
+    unsafe fn capture_device_graph<'session>(
+        &self,
+        mut context: PooledExecutionContext<'session>,
+        inputs: &[DeviceInputTensor<'_>],
+        outputs: &mut [DeviceOutputTensor<'_>],
+        stream: CudaStream<'_>,
+        key: CudaGraphKey,
+    ) -> std::result::Result<(), Box<GraphCaptureError<'session>>> {
+        if let Err(error) =
+            unsafe { self.bind_device_tensors_on_context(&mut context, inputs, outputs) }
+        {
+            return Err(Box::new(GraphCaptureError { context, error }));
+        }
+
+        let exec = match CudaGraphExec::capture(stream, || unsafe { context.enqueue_v3(stream) }) {
+            Ok(exec) => exec,
+            Err(error) => return Err(Box::new(GraphCaptureError { context, error })),
+        };
+
+        let context = context.into_inner();
+        self.cache_cuda_graph(
+            key,
+            CudaGraphEntry {
+                _context: context,
+                exec,
+            },
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cache_cuda_graph(&self, key: CudaGraphKey, entry: CudaGraphEntry) {
+        let mut cache = self.cuda_graph_cache.borrow_mut();
+        if cache.len() >= CUDA_GRAPH_MAX_CACHE_ENTRIES
+            && !cache.contains_key(&key)
+            && let Some(oldest_key) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest_key);
+        }
+        cache.insert(key, Rc::new(entry));
+    }
+
+    #[cfg(feature = "cuda")]
+    fn defer_graph_until_stream_complete(
+        &self,
+        device_location: DeviceLocation,
+        completion_event: CudaEventHandle,
+        stream: CudaStream<'_>,
+        keepalive: SmallVec<[Tensor; 8]>,
+        graph_entry: Rc<CudaGraphEntry>,
+    ) -> Result<()> {
+        let mut in_flight = self.in_flight_graphs.borrow_mut();
+        if in_flight.try_reserve(1).is_err() {
+            drop(in_flight);
+            let _ = stream.synchronize();
+            self.recycle_completion_event(device_location, completion_event);
+            return Err(Error::AllocationFailed);
+        }
+        if let Err(error) = completion_event.as_event().record(stream) {
+            drop(in_flight);
+            let _ = stream.synchronize();
+            self.recycle_completion_event(device_location, completion_event);
+            return Err(error);
+        }
+
+        in_flight.push(InFlightGraph {
+            device_location,
+            event: completion_event,
+            _keepalive: keepalive,
+            _graph_entry: graph_entry,
+        });
+        Ok(())
+    }
+
     fn clear_tensor_addresses(&self, context: &mut ExecutionContext) -> Result<()> {
         for tensor in &self.io_tensors {
             unsafe {
@@ -324,14 +675,18 @@ impl Session {
     }
 
     fn tensor_info(&self, tensor: &str) -> Result<&TensorInfo> {
-        let index = self
-            .io_tensor_index
+        let index = self.tensor_index(tensor)?;
+        Ok(&self.io_tensors[index])
+    }
+
+    fn tensor_index(&self, tensor: &str) -> Result<usize> {
+        self.io_tensor_index
             .get(tensor)
+            .copied()
             .ok_or_else(|| Error::InvalidShape {
                 tensor: tensor.to_owned(),
                 reason: "tensor is not an engine I/O tensor".to_owned(),
-            })?;
-        Ok(&self.io_tensors[*index])
+            })
     }
 
     fn tensor_data_type(&self, tensor: &str) -> Result<DataType> {
@@ -373,7 +728,7 @@ impl Session {
                 });
             }
         }
-        if shape.has_dynamic_dim() {
+        if shape.is_dynamic() {
             return Err(Error::InvalidShape {
                 tensor: tensor.to_owned(),
                 reason: format!(
@@ -638,7 +993,7 @@ impl Session {
         for (output, buffer) in outputs.iter_mut().zip(output_buffers.iter()) {
             buffer.copy_to_host(output.bytes, stream)?;
         }
-        synchronize_stream(stream)
+        stream.synchronize()
     }
 
     /// Runs TensorRT inference with host/device inputs and caller-owned CUDA
@@ -710,7 +1065,7 @@ impl Session {
         unsafe {
             context.enqueue_v3(stream)?;
         }
-        synchronize_stream(stream)
+        stream.synchronize()
     }
 
     /// Runs TensorRT inference with mixed host/staged/device inputs and
@@ -782,7 +1137,7 @@ impl Session {
         unsafe {
             context.enqueue_v3(stream)?;
         }
-        synchronize_stream(stream)
+        stream.synchronize()
     }
 
     /// Enqueues TensorRT inference with named CUDA device input/output buffers.
@@ -849,6 +1204,22 @@ impl Session {
         outputs: &mut [DeviceOutputTensor<'_>],
         stream: CudaStream<'_>,
     ) -> Result<()> {
+        unsafe {
+            self.bind_device_tensors_on_context(context, inputs, outputs)?;
+        }
+        unsafe {
+            context.enqueue_v3(stream)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    unsafe fn bind_device_tensors_on_context(
+        &self,
+        context: &mut ExecutionContext,
+        inputs: &[DeviceInputTensor<'_>],
+        outputs: &[DeviceOutputTensor<'_>],
+    ) -> Result<()> {
         for input in inputs {
             if input.ptr.is_null() {
                 return Err(Error::InvalidShape {
@@ -871,10 +1242,6 @@ impl Session {
             unsafe {
                 context.set_tensor_address(output.name, output.ptr)?;
             }
-        }
-
-        unsafe {
-            context.enqueue_v3(stream)?;
         }
         Ok(())
     }
@@ -1030,9 +1397,42 @@ impl Drop for Session {
             for in_flight in self.in_flight_contexts.get_mut().drain(..) {
                 let _ = synchronize_event(in_flight.event.as_event());
             }
+            for in_flight in self.in_flight_graphs.get_mut().drain(..) {
+                let _ = synchronize_event(in_flight.event.as_event());
+            }
+            self.cuda_graph_cache.get_mut().clear();
+            self.cuda_graph_backoff.get_mut().clear();
             self.event_pool.get_mut().clear();
         }
     }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DeviceRunCompletion {
+    device_location: DeviceLocation,
+    event: CudaEventHandle,
+    keepalive: SmallVec<[Tensor; 8]>,
+}
+
+#[cfg(feature = "cuda")]
+impl DeviceRunCompletion {
+    pub(crate) fn new(
+        device_location: DeviceLocation,
+        event: CudaEventHandle,
+        keepalive: SmallVec<[Tensor; 8]>,
+    ) -> Self {
+        Self {
+            device_location,
+            event,
+            keepalive,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct GraphCaptureError<'session> {
+    context: PooledExecutionContext<'session>,
+    error: Error,
 }
 
 #[cfg(feature = "cuda")]
@@ -1040,7 +1440,233 @@ pub(crate) struct InFlightContext {
     context: ExecutionContext,
     device_location: DeviceLocation,
     event: CudaEventHandle,
-    _keepalive: Vec<Tensor>,
+    _keepalive: SmallVec<[Tensor; 8]>,
+}
+
+#[cfg(feature = "cuda")]
+struct InFlightGraph {
+    device_location: DeviceLocation,
+    event: CudaEventHandle,
+    _keepalive: SmallVec<[Tensor; 8]>,
+    _graph_entry: Rc<CudaGraphEntry>,
+}
+
+#[cfg(feature = "cuda")]
+struct CudaGraphEntry {
+    _context: ExecutionContext,
+    exec: CudaGraphExec,
+}
+
+#[cfg(feature = "cuda")]
+struct CudaGraphBackoff {
+    remaining_runs: usize,
+    next_runs: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaGraphBackoff {
+    fn new() -> Self {
+        Self {
+            remaining_runs: CUDA_GRAPH_INITIAL_BACKOFF_RUNS,
+            next_runs: (CUDA_GRAPH_INITIAL_BACKOFF_RUNS * 2).min(CUDA_GRAPH_MAX_BACKOFF_RUNS),
+        }
+    }
+
+    fn back_off_again(&mut self) {
+        self.remaining_runs = self.next_runs;
+        self.next_runs = (self.next_runs * 2).min(CUDA_GRAPH_MAX_BACKOFF_RUNS);
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CudaGraphKey {
+    stream: usize,
+    inputs: SmallVec<[CudaGraphTensorKey; 4]>,
+    outputs: SmallVec<[CudaGraphTensorKey; 4]>,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaGraphKey {
+    fn new<I, O>(inputs: I, outputs: O, stream: CudaStream<'_>) -> Self
+    where
+        I: IntoIterator<Item = CudaGraphTensorKey>,
+        O: IntoIterator<Item = CudaGraphTensorKey>,
+    {
+        Self {
+            stream: stream.as_raw() as usize,
+            inputs: inputs.into_iter().collect(),
+            outputs: outputs.into_iter().collect(),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CudaGraphTensorKey {
+    tensor_index: usize,
+    data_type: DataType,
+    shape: Dims,
+    ptr: usize,
+    bytes: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaGraphTensorKey {
+    fn from_input(tensor_index: usize, input: &DeviceInputTensor<'_>) -> Self {
+        Self {
+            tensor_index,
+            data_type: input.data_type,
+            shape: input.shape.clone(),
+            ptr: input.ptr as usize,
+            bytes: input.bytes,
+        }
+    }
+
+    fn from_output(tensor_index: usize, output: &DeviceOutputTensor<'_>) -> Self {
+        Self {
+            tensor_index,
+            data_type: output.data_type,
+            shape: output.shape.clone(),
+            ptr: output.ptr as usize,
+            bytes: output.bytes,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_graph_tests {
+    use super::*;
+
+    fn input(ptr: usize, shape: Dims) -> DeviceInputTensor<'static> {
+        DeviceInputTensor::new("input", DataType::Float, shape, ptr as *const c_void, 16)
+    }
+
+    fn output(ptr: usize, shape: Dims) -> DeviceOutputTensor<'static> {
+        DeviceOutputTensor::new("output", DataType::Float, shape, ptr as *mut c_void, 16)
+    }
+
+    fn stream(ptr: usize) -> CudaStream<'static> {
+        unsafe { CudaStream::from_raw(ptr as *mut c_void) }
+    }
+
+    #[test]
+    fn cuda_graph_key_requires_same_stream_and_binding_addresses() {
+        let shape = Dims::new([1, 4]).unwrap();
+        let left_input = [input(0x1000, shape.clone())];
+        let left_output = [output(0x2000, shape.clone())];
+        let left = CudaGraphKey::new(
+            [CudaGraphTensorKey::from_input(0, &left_input[0])],
+            [CudaGraphTensorKey::from_output(1, &left_output[0])],
+            stream(0x3000),
+        );
+
+        assert_eq!(
+            left,
+            CudaGraphKey::new(
+                [CudaGraphTensorKey::from_input(
+                    0,
+                    &input(0x1000, shape.clone()),
+                )],
+                [CudaGraphTensorKey::from_output(
+                    1,
+                    &output(0x2000, shape.clone()),
+                )],
+                stream(0x3000),
+            )
+        );
+        assert_ne!(
+            left,
+            CudaGraphKey::new(
+                [CudaGraphTensorKey::from_input(
+                    0,
+                    &input(0x1100, shape.clone()),
+                )],
+                [CudaGraphTensorKey::from_output(
+                    1,
+                    &output(0x2000, shape.clone()),
+                )],
+                stream(0x3000),
+            )
+        );
+        assert_ne!(
+            left,
+            CudaGraphKey::new(
+                [CudaGraphTensorKey::from_input(
+                    0,
+                    &input(0x1000, shape.clone()),
+                )],
+                [CudaGraphTensorKey::from_output(
+                    1,
+                    &output(0x2100, shape.clone()),
+                )],
+                stream(0x3000),
+            )
+        );
+        assert_ne!(
+            left,
+            CudaGraphKey::new(
+                [CudaGraphTensorKey::from_input(0, &input(0x1000, shape))],
+                [CudaGraphTensorKey::from_output(
+                    1,
+                    &output(0x2000, Dims::new([1, 4]).unwrap()),
+                )],
+                stream(0x3100),
+            )
+        );
+        assert_ne!(
+            left,
+            CudaGraphKey::new(
+                [CudaGraphTensorKey::from_input(
+                    2,
+                    &input(0x1000, Dims::new([1, 4]).unwrap()),
+                )],
+                [CudaGraphTensorKey::from_output(
+                    1,
+                    &output(0x2000, Dims::new([1, 4]).unwrap()),
+                )],
+                stream(0x3000),
+            )
+        );
+        assert_ne!(
+            left,
+            CudaGraphKey::new(
+                [CudaGraphTensorKey::from_input(
+                    0,
+                    &DeviceInputTensor::new(
+                        "input",
+                        DataType::Float,
+                        Dims::new([1, 4]).unwrap(),
+                        0x1000usize as *const c_void,
+                        12,
+                    ),
+                )],
+                [CudaGraphTensorKey::from_output(
+                    1,
+                    &output(0x2000, Dims::new([1, 4]).unwrap()),
+                )],
+                stream(0x3000),
+            )
+        );
+    }
+
+    #[test]
+    fn cuda_graph_capture_backoff_is_bounded() {
+        let mut backoff = CudaGraphBackoff::new();
+
+        assert_eq!(backoff.remaining_runs, CUDA_GRAPH_INITIAL_BACKOFF_RUNS);
+        assert_eq!(
+            backoff.next_runs,
+            (CUDA_GRAPH_INITIAL_BACKOFF_RUNS * 2).min(CUDA_GRAPH_MAX_BACKOFF_RUNS)
+        );
+
+        for _ in 0..16 {
+            backoff.back_off_again();
+        }
+
+        assert_eq!(backoff.remaining_runs, CUDA_GRAPH_MAX_BACKOFF_RUNS);
+        assert_eq!(backoff.next_runs, CUDA_GRAPH_MAX_BACKOFF_RUNS);
+    }
 }
 
 pub(crate) struct PooledExecutionContext<'session> {
