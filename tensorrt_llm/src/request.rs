@@ -2,6 +2,10 @@ use crate::sampling::SamplingConfig;
 use crate::string::cstring;
 use std::ffi::CString;
 #[cfg(feature = "cuda")]
+use std::marker::PhantomData;
+#[cfg(feature = "cuda")]
+use std::ptr::NonNull;
+#[cfg(feature = "cuda")]
 use tensorrt::{CudaStream, OutputTensors};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -398,8 +402,20 @@ impl GuidedDecodingParams {
 #[derive(Clone, Debug)]
 #[cfg(feature = "cuda")]
 pub(crate) struct AdditionalOutputSink<'a> {
-    pub(crate) outputs: OutputTensors,
+    pub(crate) outputs: NonNull<OutputTensors>,
     pub(crate) stream: CudaStream<'a>,
+    pub(crate) _borrow: PhantomData<&'a mut OutputTensors>,
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> AdditionalOutputSink<'a> {
+    pub(crate) unsafe fn outputs_ref(&self) -> &'a OutputTensors {
+        unsafe { &*self.outputs.as_ptr() }
+    }
+
+    pub(crate) unsafe fn outputs_mut(&mut self) -> &'a mut OutputTensors {
+        unsafe { &mut *self.outputs.as_ptr() }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -700,8 +716,16 @@ impl<'a> Request<'a> {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn additional_outputs(mut self, outputs: OutputTensors, stream: CudaStream<'a>) -> Self {
-        self.additional_output_sink = Some(AdditionalOutputSink { outputs, stream });
+    pub fn additional_outputs(
+        mut self,
+        outputs: &'a mut OutputTensors,
+        stream: CudaStream<'a>,
+    ) -> Self {
+        self.additional_output_sink = Some(AdditionalOutputSink {
+            outputs: NonNull::from(outputs),
+            stream,
+            _borrow: PhantomData,
+        });
         self
     }
 

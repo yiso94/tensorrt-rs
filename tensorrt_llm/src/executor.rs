@@ -518,7 +518,8 @@ impl Executor {
 
         #[cfg(feature = "cuda")]
         if let Some(additional_outputs) = additional_outputs.as_ref() {
-            for (name, _) in additional_outputs.outputs.iter() {
+            let outputs = unsafe { additional_outputs.outputs_ref() };
+            for (name, _) in outputs.iter() {
                 request.infer_output_tensor_name(name);
             }
         }
@@ -532,9 +533,8 @@ impl Executor {
 
         #[cfg(feature = "cuda")]
         if let Some(mut sink) = sink {
-            let mut response = self.run_prepared_with_sink(&prepared, Some(&mut sink))?;
+            let response = self.run_prepared_with_sink(&prepared, Some(&mut sink))?;
             sink.ensure_all_written()?;
-            response.output.extend_tensors(sink.into_outputs());
             return Ok(response);
         }
 
@@ -542,12 +542,13 @@ impl Executor {
     }
 
     #[cfg(feature = "cuda")]
-    fn prepare_output_sink(
+    fn prepare_output_sink<'a>(
         &self,
-        additional_outputs: AdditionalOutputSink<'_>,
+        mut additional_outputs: AdditionalOutputSink<'a>,
     ) -> Result<OutputSinkParts> {
+        let outputs = unsafe { additional_outputs.outputs_mut() };
         OutputSinkParts::new(
-            additional_outputs.outputs,
+            outputs,
             additional_outputs.stream,
             Arc::clone(&self.event_pool),
             Arc::clone(&self.sink_scratch_pool),
@@ -1216,7 +1217,6 @@ impl Drop for Executor {
 
 #[cfg(feature = "cuda")]
 struct OutputSinkParts {
-    outputs: Option<OutputTensors>,
     completion_event: Arc<PooledCudaEvent>,
     scratch: Option<OutputSinkScratch>,
     scratch_pool: Arc<OutputSinkScratchPool>,
@@ -1226,7 +1226,7 @@ struct OutputSinkParts {
 #[cfg(feature = "cuda")]
 impl OutputSinkParts {
     fn new(
-        outputs: OutputTensors,
+        outputs: &mut OutputTensors,
         stream: CudaStream<'_>,
         event_pool: Arc<CudaEventPool>,
         scratch_pool: Arc<OutputSinkScratchPool>,
@@ -1250,22 +1250,15 @@ impl OutputSinkParts {
 
         let completion_event = event_pool.checkout(stream_location, stream)?;
 
-        let output_count = outputs.iter().count();
-        if output_count == 0 {
-            return Err(Error::InvalidArgument(
-                "Request::additional_outputs requires at least one preallocated output tensor"
-                    .into(),
-            ));
-        }
-
         let mut scratch = scratch_pool.checkout()?;
-        if !scratch.layout_matches(&outputs) {
-            scratch.rebuild_layout(&outputs)?;
+        if !scratch.layout_matches(outputs) {
+            scratch.rebuild_layout(outputs)?;
         } else {
             scratch.reset_written();
             scratch.refresh_stable_pointers();
         }
 
+        let output_count = outputs.iter().count();
         let mut ranges: SmallVec<[CudaMemoryRange<'_>; 8]> = SmallVec::with_capacity(output_count);
         for (index, (name, tensor)) in outputs.iter().enumerate() {
             if tensor.device().location() != stream_location {
@@ -1308,7 +1301,6 @@ impl OutputSinkParts {
         };
 
         Ok(Self {
-            outputs: Some(outputs),
             completion_event,
             scratch: Some(scratch),
             scratch_pool,
@@ -1341,12 +1333,6 @@ impl OutputSinkParts {
             }
         }
         Ok(())
-    }
-
-    fn into_outputs(mut self) -> OutputTensors {
-        self.outputs
-            .take()
-            .expect("output tensors are only absent during drop")
     }
 
     fn recycle_scratch(&mut self) {
@@ -2136,7 +2122,6 @@ mod tests {
             pool: Arc::clone(&event_pool),
         });
         let mut parts = OutputSinkParts {
-            outputs: None,
             completion_event,
             scratch: Some(scratch),
             scratch_pool: Arc::new(OutputSinkScratchPool::default()),
@@ -2334,11 +2319,12 @@ mod tests {
     #[test]
     fn additional_output_sink_validation_runs_before_request_preparation() {
         let executor = fake_executor();
-        let outputs = OutputTensors::new([(
+        let mut outputs = OutputTensors::new([(
             "marked_model_output",
             Tensor::zeros((1, 2, 4), DType::F32, &Device::Cpu).unwrap(),
         )]);
-        let mut request = Request::new(&[1; 16]).additional_outputs(outputs, CudaStream::DEFAULT);
+        let mut request =
+            Request::new(&[1; 16]).additional_outputs(&mut outputs, CudaStream::DEFAULT);
         let additional_outputs = request.additional_output_sink.take().unwrap();
 
         let error = match executor.prepare_output_sink(additional_outputs) {
@@ -2369,6 +2355,10 @@ mod tests {
         let skip_blocks = Tensor::from_vec(vec![0i32, 1], 2, &Device::Cpu).unwrap();
         let bad = [4, 5];
         let stop = [2];
+        let mut outputs = OutputTensors::new([(
+            "marked_model_output",
+            Tensor::zeros((1, 2, 4), DType::F32, &Device::Cpu).unwrap(),
+        )]);
         let request = Request::new(&input_ids)
             .prompt_embeddings(&prompt_embeddings)
             .embedding_bias(&embedding_bias)
@@ -2387,13 +2377,7 @@ mod tests {
             .encoder_features(&encoder_features)
             .cross_attention_mask(&cross_attention_mask)
             .skip_cross_attention_blocks(&skip_blocks)
-            .additional_outputs(
-                OutputTensors::new([(
-                    "marked_model_output",
-                    Tensor::zeros((1, 2, 4), DType::F32, &Device::Cpu).unwrap(),
-                )]),
-                CudaStream::DEFAULT,
-            );
+            .additional_outputs(&mut outputs, CudaStream::DEFAULT);
 
         let error = match executor.prepare_request(request) {
             Ok(_) => panic!("preallocated additional outputs should be rejected outside run"),

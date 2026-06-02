@@ -86,15 +86,6 @@ impl ExecutorOutput {
         self.is_sequence_final
     }
 
-    #[cfg(feature = "cuda")]
-    pub(crate) fn extend_tensors(&mut self, tensors: impl IntoIterator<Item = (String, Tensor)>) {
-        self.tensors.extend(
-            tensors
-                .into_iter()
-                .map(|(name, tensor)| TensorOutput::ready(name, tensor)),
-        );
-    }
-
     #[cfg(test)]
     pub(crate) fn tensor_is_materialized(&self, name: &str) -> Option<bool> {
         self.tensors
@@ -149,14 +140,6 @@ struct TensorOutput {
 }
 
 impl TensorOutput {
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    fn ready(name: impl Into<String>, tensor: Tensor) -> Self {
-        Self {
-            name: name.into(),
-            tensor: LazyTensor::Ready(tensor),
-        }
-    }
-
     fn int32(
         name: impl Into<String>,
         raw: *const i32,
@@ -235,7 +218,6 @@ impl TensorOutput {
 #[derive(Debug)]
 enum LazyTensor {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    Ready(Tensor),
     Deferred {
         data: TensorData,
         shape: Vec<usize>,
@@ -342,7 +324,6 @@ impl LazyTensor {
 
     fn tensor(&self) -> &Tensor {
         match self {
-            Self::Ready(tensor) => tensor,
             Self::Deferred {
                 data,
                 shape,
@@ -360,7 +341,6 @@ impl LazyTensor {
 
     fn into_tensor(self) -> Tensor {
         match self {
-            Self::Ready(tensor) => tensor,
             Self::Deferred {
                 data,
                 shape,
@@ -385,7 +365,6 @@ impl LazyTensor {
     #[cfg(test)]
     fn is_materialized(&self) -> bool {
         match self {
-            Self::Ready(_) => true,
             Self::Deferred { tensor, .. } => tensor.get().is_some(),
             Self::Raw { tensor, .. } => tensor.get().is_some(),
             Self::Offsets { tensor, .. } => tensor.get().is_some(),
@@ -1098,104 +1077,6 @@ mod tests {
         );
         assert_eq!(output.sequence_index(), 2);
         assert!(output.is_sequence_final());
-    }
-
-    #[test]
-    fn get_and_index_include_additional_outputs() {
-        let output = ExecutorOutput {
-            tensors: vec![
-                TensorOutput::ready(
-                    "token_ids".to_owned(),
-                    Tensor::from_vec(vec![1i32], 1, &Device::Cpu).unwrap(),
-                ),
-                TensorOutput::ready(
-                    "marked_model_output".to_owned(),
-                    Tensor::from_vec(vec![1f32], 1, &Device::Cpu).unwrap(),
-                ),
-                TensorOutput::ready(
-                    "generation_score".to_owned(),
-                    Tensor::from_vec(vec![2f32], 1, &Device::Cpu).unwrap(),
-                ),
-            ],
-            is_final: true,
-            finish_reasons: Vec::new(),
-            context_phase_params: None,
-            spec_dec_fast_logits_info: None,
-            sequence_index: 0,
-            is_sequence_final: true,
-        };
-
-        assert_eq!(output["token_ids"].dims(), &[1]);
-        assert_eq!(output["marked_model_output"].dims(), &[1]);
-        assert_eq!(output.get("generation_score").unwrap().dims(), &[1]);
-    }
-
-    #[test]
-    fn iteration_includes_every_tensor_output() {
-        let output = ExecutorOutput {
-            tensors: vec![
-                TensorOutput::ready(
-                    "token_ids".to_owned(),
-                    Tensor::from_vec(vec![1i32], 1, &Device::Cpu).unwrap(),
-                ),
-                TensorOutput::ready(
-                    "marked_model_output".to_owned(),
-                    Tensor::from_vec(vec![1f32], 1, &Device::Cpu).unwrap(),
-                ),
-                TensorOutput::ready(
-                    "generation_score".to_owned(),
-                    Tensor::from_vec(vec![2f32], 1, &Device::Cpu).unwrap(),
-                ),
-            ],
-            is_final: true,
-            finish_reasons: Vec::new(),
-            context_phase_params: None,
-            spec_dec_fast_logits_info: None,
-            sequence_index: 0,
-            is_sequence_final: true,
-        };
-
-        let names = output.iter().map(|(name, _)| name).collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec!["token_ids", "marked_model_output", "generation_score"]
-        );
-
-        let names = output.into_iter().map(|(name, _)| name).collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec!["token_ids", "marked_model_output", "generation_score"]
-        );
-    }
-
-    #[test]
-    fn consuming_iterator_reports_exact_remaining_length() {
-        let output = ExecutorOutput {
-            tensors: vec![
-                TensorOutput::ready(
-                    "token_ids".to_owned(),
-                    Tensor::from_vec(vec![1i32], 1, &Device::Cpu).unwrap(),
-                ),
-                TensorOutput::ready(
-                    "marked_model_output".to_owned(),
-                    Tensor::from_vec(vec![1f32], 1, &Device::Cpu).unwrap(),
-                ),
-            ],
-            is_final: true,
-            finish_reasons: Vec::new(),
-            context_phase_params: None,
-            spec_dec_fast_logits_info: None,
-            sequence_index: 0,
-            is_sequence_final: true,
-        };
-
-        let mut iter = output.into_iter();
-        assert_eq!(iter.len(), 2);
-        assert_eq!(iter.next().unwrap().0, "token_ids");
-        assert_eq!(iter.len(), 1);
-        assert_eq!(iter.next().unwrap().0, "marked_model_output");
-        assert_eq!(iter.len(), 0);
-        assert!(iter.next().is_none());
     }
 
     #[test]

@@ -219,9 +219,9 @@ fn additional_outputs_use_the_request_api() {
     let device = Device::Cpu;
     let input_ids = [10, 11];
     let output = Tensor::zeros((2, 4), candle_core::DType::F32, &device).unwrap();
-    let outputs = OutputTensors::new([("marked_model_output", output)]);
+    let mut outputs = OutputTensors::new([("marked_model_output", output)]);
 
     let _request = Request::new(&input_ids)
         .max_new_tokens(8)
-        .additional_outputs(outputs, CudaStream::DEFAULT);
+        .additional_outputs(&mut outputs, CudaStream::DEFAULT);
 }
